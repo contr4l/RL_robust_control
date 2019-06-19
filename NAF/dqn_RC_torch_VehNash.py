@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import torch
 from naf import NAF
+from tensorboardX import pytorch_graph
 from replay_memory import ReplayMemory, Transition
 import numpy as np
 import random
@@ -12,7 +13,7 @@ import os
 import random
 from keras.models import load_model
 import pandas as pd
-from DnsCarFollowENV2 import VehicleFollowingENV
+
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
@@ -84,8 +85,16 @@ def fit_nash():
     param_noise_attacker = AdaptiveParamNoiseSpec(initial_stddev=0.05,
                                                   desired_action_stddev=args.noise_scale,
                                                   adaptation_coefficient=1.05) if args.param_noise else None
-    res_data = pd.DataFrame(columns=['Weight', 'Attack', 'Eva_distance'])
-    reward_data = pd.DataFrame(columns=['Reward'])
+    try:
+        res_data = pd.read_csv(suffix + '.csv', names=['Weight', 'Attack', 'Eva_distance'])
+    except:
+        res_data = pd.DataFrame(columns=['Weight', 'Attack', 'Eva_distance'])
+
+    try:
+        reward_data = pd.read_csv(suffix + '_reward_.csv', names=['Reward'])
+    except:
+        reward_data = pd.DataFrame(columns=['Reward'])
+
     rewards = []
     total_numsteps = 0
     for i_episode in range(args.num_episodes):
@@ -96,7 +105,7 @@ def fit_nash():
 
         if args.NashMode == 0:
             ETA = 0
-        elif args.NashMode == 1:
+        elif args.NashMode in [1, 4]:
             ETA = 0.5
         elif args.NashMode == 2:
             ETA = 0.1 - i_episode/args.num_episodes * 0.1
@@ -108,15 +117,14 @@ def fit_nash():
         # weight_file = open('vehicle_weight' + suffix + '.txt', 'a')
         # distance_file = open('Distance' + suffix + '.txt', 'a')
 
-        local_steps = 0
         state = env.reset()
         state_record = [np.array([state])]
         episode_steps = 0
         while len(state_record) < 20:
             a, b = env.random_action()
             s, _, _ = env.step(np.array([a]), np.zeros(4))
-            local_steps += 1
             state_record.append(s)
+        env.step_number = 0
         if args.ou_noise:
             ounoise_vehicle.scale = (args.noise_scale - args.final_noise_scale) * max(0, args.exploration_end -
                                                                                       i_episode) / args.exploration_end + args.final_noise_scale
@@ -130,14 +138,8 @@ def fit_nash():
         while True:
             sigma = random.random()
             if sigma > ETA:
-                # print(state_record[-20:])
-                # print('rl', torch.Tensor(state_record[-20:]).shape)
                 action_vehicle = agent_vehicle.select_action(torch.Tensor(state_record[-20:]), ounoise_vehicle,
                                                              param_noise_vehicle)[:, -1, :]
-                # print('rl', action_vehicle.shape)
-                action_attacker = agent_attacker.select_action(torch.Tensor(state_record[-20:]), ounoise_attacker,
-                                                               param_noise_attacker)[:, -1, :]
-                # print('rl', action_vehicle.shape)
             else:
                 action_vehicle = torch.Tensor(
                     [policy_vehicle.predict(state_record[-1].reshape(-1, 4)) / policy_vehicle.predict(
@@ -146,15 +148,16 @@ def fit_nash():
                     [policy_attacker.predict(state_record[-1].reshape(-1, 4)) / policy_attacker.predict(
                         state_record[-1].reshape(-1, 4)).sum()])[0]
 
-            # 限制权重和为1
+            # Nash_Mode = 4
+            action_attacker = agent_attacker.select_action(torch.Tensor(state_record[-20:]), ounoise_attacker,
+                                                           param_noise_attacker)[:, -1, :]
+
             action_vehicle = action_vehicle.numpy()[0]/(action_vehicle.numpy()[0].sum())
             action_attacker = action_attacker.numpy()[0]
-
+            # attack_file.write(str(action_attacker) + '\n')
+            # weight_file.write(str(action_vehicle) + '\n')
             next_state, reward, done = env.step(action_vehicle, action_attacker)
-            res_data = res_data.append([{'Attack':env.action_attacker, 'Weight':action_vehicle, 'Eva_distance':env.d}])
-
-            # 将处理的攻击值赋给原值
-            action_attacker = env.action_attacker
+            res_data = res_data.append([{'Attack':action_attacker, 'Weight':action_vehicle, 'Eva_distance':env.d}])
 
             total_numsteps += 1
             episode_reward += reward
@@ -171,6 +174,7 @@ def fit_nash():
             action_attacker = torch.Tensor(action_attacker.reshape(1,4))
 
             mask = torch.Tensor([not done])
+
             prev_state = torch.Tensor(state_record[-20:]).transpose(0, 1)
             next_state = torch.Tensor([next_state])
 
@@ -187,7 +191,7 @@ def fit_nash():
                     # reward_file.write('Episode {} ends, instant reward is {:.2f}\n'.format(i_episode, episode_reward))
                 break
 
-        if min(len(memory_vehicle), len(memory_SL_vehicle)) > args.batch_size:  # 开始训练
+        if len(memory_vehicle) > args.batch_size:  # 开始训练
             for _ in range(args.updates_per_step):
                 transitions_vehicle = memory_vehicle.sample(args.batch_size)
                 batch_vehicle = Transition(*zip(*transitions_vehicle))
@@ -224,61 +228,54 @@ def fit_nash():
                 # writer.add_scalar('loss/value', value_loss, updates)
                 # writer.add_scalar('loss/policy', policy_loss, updates)
 
-        if i_episode % 10 == 0 and i_episode != 0:
-
-            eva_res_data = pd.DataFrame(columns=['Eva_reward', 'Eva_distance'])
-
-
-            # distance_file.write('{} episode starts, recording distance...\n'.format(i_episode))
-            state = env.reset()
-            state_record = [np.array([state])]
-            evaluate_reward = 0
-            while len(state_record) < 20:
-                a, b = env.random_action()
-                s, _, _ = env.step(np.array([a]), np.zeros(4))
-                local_steps += 1
-                state_record.append(s)
-            while True:
-                if random.random() < ETA:
-                    action_vehicle = agent_vehicle.select_action(torch.Tensor(state_record[-20:]), ounoise_vehicle,
-                                                                 param_noise_vehicle)[:, -1, :]
-                    # print('rl', action_vehicle.shape)
-                    action_attacker = agent_attacker.select_action(torch.Tensor(state_record[-20:]), ounoise_attacker,
-                                                                   param_noise_attacker)[:, -1, :]
-                else:
-                    action_vehicle = torch.Tensor(
-                        [policy_vehicle.predict(state_record[-1].reshape(-1, 4)) / policy_vehicle.predict(
-                            state_record[-1].reshape(-1, 4)).sum()])[0]
-                    action_attacker = torch.Tensor(
-                        [policy_attacker.predict(state_record[-1].reshape(-1, 4))])[0]
-
-                action_vehicle = action_vehicle.numpy()[0] / action_vehicle.numpy()[0].sum()
-                action_attacker = action_attacker.numpy()[0]
-                next_state, reward, done = env.step(action_vehicle, action_attacker, attack_mode=2)
-
-                eva_res_data = eva_res_data.append([{'Eva_reward':evaluate_reward, 'Eva_distance':env.d}])
-                evaluate_reward += reward
-
-
-                if done:
-                    print("Episode: {}, total numsteps: {}, reward: {}, average reward: {}".format(i_episode,
-                                                                                                   total_numsteps,
-                                                                                                   evaluate_reward,
-                                                                                                   np.mean(rewards[-10:])))
-                    # reward_file.write("Episode: {}, total numsteps: {}, reward: {}, average reward: {}\n".format(i_episode,
-                    #                                                                                              total_numsteps,
-                    #                                                                                              evaluate_reward,
-                    #                                                                                              np.mean(rewards[-10:])))
-                    break
+        # if i_episode % 10 == 0:
+        #     # distance_file.write('{} episode starts, recording distance...\n'.format(i_episode))
+        #     state = env.reset()
+        #     state_record = [np.array([state])]
+        #     evaluate_reward = 0
+        #     while len(state_record) < 20:
+        #         a, b = env.random_action()
+        #         s, _, _ = env.step(np.array([a]), np.zeros(4))
+        #         local_steps += 1
+        #         state_record.append(s)
+        #     while True:
+        #         if random.random() < ETA:
+        #             action_vehicle = agent_vehicle.select_action(torch.Tensor(state_record[-20:]), ounoise_vehicle,
+        #                                                          param_noise_vehicle)[:, -1, :]
+        #             # print('rl', action_vehicle.shape)
+        #             action_attacker = agent_attacker.select_action(torch.Tensor(state_record[-20:]), ounoise_attacker,
+        #                                                            param_noise_attacker)[:, -1, :]
+        #         else:
+        #             action_vehicle = torch.Tensor(
+        #                 [policy_vehicle.predict(state_record[-1].reshape(-1, 4)) / policy_vehicle.predict(
+        #                     state_record[-1].reshape(-1, 4)).sum()])[0]
+        #             action_attacker = torch.Tensor(
+        #                 [policy_attacker.predict(state_record[-1].reshape(-1, 4))])[0]
+        #
+        #         action_vehicle = action_vehicle.numpy()[0] / action_vehicle.numpy()[0].sum()
+        #         action_attacker = action_attacker.numpy()[0]
+        #         next_state, reward, done = env.step(action_vehicle, action_attacker)
+        #         # distance_file.write('The distance is ' + str(env.d) + '\n')
+        #         evaluate_reward += reward
+        #
+        #         if done:
+        #             print("Episode: {}, total numsteps: {}, reward: {}, average reward: {}".format(i_episode,
+        #                                                                                            total_numsteps,
+        #                                                                                            evaluate_reward,
+        #                                                                                            np.mean(rewards[-10:])))
+        #             # reward_file.write("Episode: {}, total numsteps: {}, reward: {}, average reward: {}\n".format(i_episode,
+        #             #                                                                                              total_numsteps,
+        #             #                                                                                              evaluate_reward,
+        #             #                                                                                              np.mean(rewards[-10:])))
+        #             break
         #         # writer.add_scalar('reward/test', episode_reward, i_episode)
         # reward_file.close()
         # attack_file.close()
         # weight_file.close()
         # distance_file.close()
     env.close()
-    reward_data.to_csv(suffix+'_reward.csv', index=False)
+    reward_data.to_csv(suffix+'.csv', index=False)
     res_data.to_csv(suffix+'.csv', index=False)
-    eva_res_data.to_csv(suffix+'_eva.csv', index=False)
 
     # save model
     agent_vehicle.save_model('vehicle_'+suffix)
@@ -331,6 +328,7 @@ if __name__ == '__main__':
     parser.add_argument('--RewardMode', type=int, default=3, metavar='N',
                         help='Reward mode (default: 3)')
     # python3 dqn_RC_torch.py --Nash True
+    from DnsCarFollowENV2 import VehicleFollowingENV
 
     args = parser.parse_args()
     env = VehicleFollowingENV(args)

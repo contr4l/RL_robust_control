@@ -6,13 +6,13 @@ VMAX = 30
 VMIN = 10
 ACC_MODE = 0
 UPPER_BOUND = 100
-ATTACKER_LIMIT = np.array([1, 1, 1, 1])  # 攻击阈值
 observation_space = 4
 action_space = 4
 vehicle_action_space = 4
 AMAX = 5
-ATTACK_MODE = 1
-REWARD_MODE = 2
+
+ATTACK_BOUND = np.array([1, 2, 0.5, 1.5])
+# SAFE_DISTANCE = 10
 """
 备份文件
 """
@@ -20,7 +20,7 @@ REWARD_MODE = 2
 class VehicleFollowingENV(object):
 
 
-    def __init__(self):
+    def __init__(self, args=None):
         '''
         :param
         d0:     初始车距, 范围在10m~30m间
@@ -31,10 +31,11 @@ class VehicleFollowingENV(object):
         sample_interval: 采样时间, 单位: s
         a_head: 前车加速度
         '''
-        self.sensor_error = np.array([0.1, 0.1, 0.1, 0.1])  # 传感器误差高斯噪声
+        self.sensor_error = np.array([0, 0, 0, 0])  # 传感器误差高斯噪声
         self.lam = 1  # 控制量
-        self.d0 = np.random.randint(10, 30)  # 初始距离
+        self.d0 = 25  # 初始距离
         self.d = self.d0  # 实时距离
+        self.d_prev = self.d  # 上一步跟车距离
         self.init_v = np.random.random() * (VMAX-VMIN) + VMIN
         self.v_head = self.init_v  # 前车速度
         self.v = self.v_head  # 自车速度
@@ -47,9 +48,20 @@ class VehicleFollowingENV(object):
         self.observation_space = observation_space
         self.vehicle_action_space = vehicle_action_space
         self.attacker_action_space = vehicle_action_space
-        self.RC = 0
-        self.reward_mode = REWARD_MODE
-        self.attack_mode = ATTACK_MODE
+        if args:
+            self.reward_mode = args.RewardMode
+            self.attack_mode = args.AttackMode
+            self.max_numstep = args.num_steps
+        else:
+            self.reward_mode = 3
+            self.attack_mode = 6
+            self.max_numstep = 100000
+
+    def random_action(self):
+        weight = np.random.random(4)
+        weight = weight / weight.sum()
+        attrack = np.random.randn(4)
+        return weight, attrack
 
     def reset(self):
         '''
@@ -60,6 +72,7 @@ class VehicleFollowingENV(object):
         '''
         self.step_number = 0
         self.d = self.d0
+        self.d_prev = self.d
         self.v_cal_raw = self.init_v * np.ones(4)
         return self.v_cal_raw
 
@@ -83,7 +96,7 @@ class VehicleFollowingENV(object):
         # 控制结果 公式1
         self.action_car = self.lam * (self.v_cal - self.v)
 
-    def step(self, action_weight=np.ones(4), action_attacker=np.zeros(4)):  # =np.ones(4), action_attacker=np.zeros(4)):
+    def step(self, action_weight=np.ones(4), action_attacker=np.zeros(4), attack_mode=None):  # =np.ones(4), action_attacker=np.zeros(4)):
         '''
         环境的步进, 输入攻击者和自车的权重动作，通过控制器, 返回新的Reward和观测值
         :param
@@ -96,32 +109,42 @@ class VehicleFollowingENV(object):
         is_done:    是否发生碰撞
         '''
         # 更新步数
+        reward = 0
+        is_done = False
+
         self.step_number = self.step_number + 1
-        if self.step_number % 10000 == 0:
-            print(self.step_number, self.d)
+        # if self.step_number % 10000 == 0:
+        #     print(self.step_number, self.d)
         # 在环境中限制Attacker
-        [a0, a1, a2, a3] = action_attacker[0]
-        # a0 = 1 if a0 > 1 else a0
-        # a0 = -1 if a0 < -1 else a0
-        # a1 = 1 if a1 > 1 else a1
-        # a1 = -1 if a1 < -1 else a1
-        # a2 = 0.5 if a2 > 0.5 else a2
-        # a2 = -0.5 if a2 < -0.5 else a2
-        # a3 = 1.5 if a3 > 1.5 else a3
-        # a3 = -1.5 if a3 < -1.5 else a3
+        [a0, a1, a2, a3] = action_attacker
+
+        if attack_mode:
+            self.attack_mode = attack_mode
+
         if self.attack_mode == 1:
             # 攻击a1
-            action_attacker = np.array([[a0, 0, 0, 0]])
+            self.action_attacker = np.array([a0, 0, 0, 0])
         elif self.attack_mode == 2:
             # 攻击a2和a3
-            action_attacker = np.array([[0, 0, a2, a3]])
-        else:
-            # 全部攻击
-            action_attacker = np.array([[a0, a1, a2, a3]])
+            self.action_attacker = np.array([0, 0, a2, a3])
+        elif self.attack_mode == 4:
+            # 最大攻击
+            self.action_attacker = np.array([1,0,0,0])
+        elif self.attack_mode == 6:
+            self.action_attacker = np.array([-0.25, 0., -0.75, 0.])
+        elif self.attack_mode == 5:
+            self.action_attacker = np.array([a0, a1, a2, a3])
+        elif self.attack_mode == 7:
+            index1, index2 = np.random.choice([0,1,2,3], 2, False)
+            w_ = np.zeros(4)
+            w_[index1] = w_[index2] = 1
+            self.action_attacker = action_attacker * w_
 
-
+        if self.action_attacker.sum() != 0:
+            self.action_attacker = self.action_attacker / self.action_attacker.sum()
+        self.action_attacker = np.array([self.action_attacker])
         # 更新控制
-        self.control(action_weight, action_attacker)
+        self.control(action_weight, self.action_attacker)
         # 前车行驶距离(保留没有变)
         s_head = self.v_head * self.sample_interval + 0.5 * self.a_head * self.sample_interval * self.sample_interval
         # 自车行驶距离（保留没有变）
@@ -134,12 +157,6 @@ class VehicleFollowingENV(object):
         self.v = VMIN + 0.01 if self.v < VMIN else self.v
         self.v = VMAX - 0.01 if self.v > VMAX else self.v
         # 返回结果
-        if self.d <= 1 or self.d >= UPPER_BOUND or self.step_number > 100000:
-            is_done = True
-            if is_done:
-                print('Dead Once', 'step is', self.step_number)
-        else:
-            is_done = False
 
         # 距离方差形式的Reward
         if self.reward_mode == 1:
@@ -161,6 +178,26 @@ class VehicleFollowingENV(object):
                 r_y = -100
             reward = (np.array([r_v, r_a, r_y]) * factor).sum()
 
+        elif self.reward_mode == 3:
+            if abs(self.d-self.d0) < 5:
+                reward = 1
+
+        elif self.reward_mode == 4:
+            if abs(self.d-self.d0) <= abs(self.d_prev-self.d0):
+                reward = 1
+            elif abs(self.d-self.d0) > abs(self.d_prev-self.d0):
+                reward = -1
+        elif self.reward_mode == 5:
+            reward = (5 - abs(self.v_cal - self.v_head))
+
+        if self.step_number > self.max_numstep:
+            print('Following Car success', 'step is', self.step_number - 1, 'final distance is ', self.d)
+            is_done = True
+
+        if abs(self.d-self.d0) > 5:
+            is_done = True
+
+        self.d_prev = self.d
         next_state = self.v_cal_raw
         return next_state, reward, is_done
 
